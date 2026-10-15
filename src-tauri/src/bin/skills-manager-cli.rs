@@ -1217,11 +1217,13 @@ fn resolve_skill_references(
 /// deployments through its native config and caches resolutions per process,
 /// so removing only the managed link leaves it able to resolve the skill.
 /// Only entries naming paths this batch deployed or withdrew are touched;
-/// the editor preserves native extras, comments and unrelated settings, and
-/// holds (writes nothing) on structure it cannot rewrite — a held result is
-/// an explicit partial outcome, reported as such. A warm reader also needs
-/// the native reload step; the Manager has no channel into it, so every
-/// touched outcome carries `native_reload_required`.
+/// paths the batch preserved (#363) must not be handed in — their content is
+/// the user's, and the entry now serves that content. The editor preserves
+/// native extras, comments and unrelated settings, and holds (writes nothing)
+/// on structure it cannot rewrite — a held result is an explicit partial
+/// outcome, reported as such. A warm reader also needs the native reload
+/// step; the Manager has no channel into it, so every touched outcome carries
+/// `native_reload_required`.
 fn reconcile_hermes_consumers(
     store: &SkillStore,
     per_agent: Vec<(String, Vec<PathBuf>)>,
@@ -1279,14 +1281,20 @@ fn reconcile_hermes_consumers(
 }
 
 /// Group `(skill_id, agent_key)` pairs of one batch onto their target paths,
-/// using the given (skill, tool) → path table.
+/// using the given (skill, tool) → path table. `exclude_paths` names paths the
+/// batch deliberately did not remove (`verification.preserved` on undeploy):
+/// their content is the user's now, so no consumer-side withdrawal may name
+/// them, or the native config would stop serving that content.
 fn paths_for_succeeded_pairs(
     pairs: &std::collections::HashSet<(String, String)>,
     rows: &[app_lib::core::skill_store::SkillTargetRecord],
+    exclude_paths: &[String],
 ) -> Vec<(String, Vec<PathBuf>)> {
     let mut per_agent: Vec<(String, Vec<PathBuf>)> = Vec::new();
     for row in rows {
-        if pairs.contains(&(row.skill_id.clone(), row.tool.clone())) {
+        if pairs.contains(&(row.skill_id.clone(), row.tool.clone()))
+            && !exclude_paths.iter().any(|path| path == &row.target_path)
+        {
             match per_agent.iter_mut().find(|(key, _)| *key == row.tool) {
                 Some((_, paths)) => paths.push(PathBuf::from(&row.target_path)),
                 None => per_agent.push((row.tool.clone(), vec![PathBuf::from(&row.target_path)])),
@@ -1355,8 +1363,9 @@ fn run_skill_deployment(
                 .collect();
         hermes_reconciliation = reconcile_hermes_consumers(store, planned, true, true);
     } else if dry_run {
-        // Undeploy preview: the entries this batch would withdraw.
-        let planned = paths_for_succeeded_pairs(&changed, &existing_targets);
+        // Undeploy preview: the entries this batch would withdraw. Nothing is
+        // removed yet, so nothing can be preserved yet.
+        let planned = paths_for_succeeded_pairs(&changed, &existing_targets, &[]);
         hermes_reconciliation = reconcile_hermes_consumers(store, planned, false, true);
     } else if !dry_run {
         scenario_service::apply_skills_to_tools(
@@ -1400,14 +1409,21 @@ fn run_skill_deployment(
         // Only fully verified pairs reconcile: the rows on hand name the paths
         // this batch actually wrote (deploy) or actually removed (undeploy).
         // A batch with verification issues bailed above, so the native config
-        // is never reconciled against a half-removed deployment.
+        // is never reconciled against a half-removed deployment. On undeploy,
+        // `preserved` paths stay out of the withdrawal even though their pairs
+        // verified: the content at them is the user's now (#363), and its
+        // native config entry is not ours to take.
         let fresh_rows = store.get_all_targets()?;
         let rows: &Vec<app_lib::core::skill_store::SkillTargetRecord> = if deploy {
             &fresh_rows
         } else {
             &existing_targets
         };
-        let per_agent = paths_for_succeeded_pairs(&verification.succeeded, rows);
+        let per_agent = paths_for_succeeded_pairs(
+            &verification.succeeded,
+            rows,
+            if deploy { &[] } else { &verification.preserved },
+        );
         hermes_reconciliation = reconcile_hermes_consumers(store, per_agent, deploy, false);
     }
 
@@ -3023,7 +3039,8 @@ fn run_preset_deployment(
                 .collect();
         hermes_reconciliation = reconcile_hermes_consumers(store, planned, true, true);
     } else if dry_run {
-        let planned = paths_for_succeeded_pairs(&changed, &existing_targets);
+        // Nothing is removed yet, so nothing can be preserved yet.
+        let planned = paths_for_succeeded_pairs(&changed, &existing_targets, &[]);
         hermes_reconciliation = reconcile_hermes_consumers(store, planned, false, true);
     } else if !dry_run {
         scenario_service::apply_skills_to_tools(
@@ -3078,7 +3095,13 @@ fn run_preset_deployment(
         } else {
             &existing_targets
         };
-        let per_agent = paths_for_succeeded_pairs(&verification.succeeded, rows);
+        // Preserved paths stay out of the withdrawal on undeploy, exactly as
+        // in `run_skill_deployment` (#363): their content is the user's now.
+        let per_agent = paths_for_succeeded_pairs(
+            &verification.succeeded,
+            rows,
+            if deploy { &[] } else { &verification.preserved },
+        );
         hermes_reconciliation = reconcile_hermes_consumers(store, per_agent, deploy, false);
     }
 
@@ -4062,6 +4085,78 @@ agent:
         assert!(
             !skills_root.join("demo").exists(),
             "the undeploy itself still ran"
+        );
+
+        std::env::remove_var("HERMES_HOME");
+    }
+
+    /// A path whose content the Manager deliberately did not delete (#363) —
+    /// the user's directory took our deployment's place — keeps its native
+    /// config entry too: the entry now serves the user's content, and
+    /// withdrawing it would hide that content from a running Hermes reader.
+    /// The pair still verifies as succeeded (the record is gone, keeping the
+    /// path was correct), so the exclusion has to happen between verification
+    /// and reconciliation.
+    #[test]
+    fn hermes_undeploy_keeps_the_entry_for_a_preserved_path() {
+        let _env_guard = HERMES_HOME_LOCK.lock().unwrap();
+        let tmp = tempdir().unwrap();
+        let hermes_home = tmp.path().join(".hermes");
+        let skills_root = hermes_home.join("skills");
+        fs::create_dir_all(&skills_root).unwrap();
+        let config_path = hermes_home.join("config.yaml");
+        fs::write(&config_path, hermes_profile_config()).unwrap();
+        std::env::set_var("HERMES_HOME", &hermes_home);
+        let store = hermes_profile_store(&tmp, &skills_root);
+        store.set_setting("sync_mode", "symlink").unwrap();
+
+        run_skill_deployment(
+            &store,
+            &["demo".to_string()],
+            &["hermes-profile".to_string()],
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(fs::read_to_string(&config_path)
+            .unwrap()
+            .contains("    - skills/demo\n"));
+
+        // The user takes the path over with a real directory of their own.
+        let target = skills_root.join("demo");
+        fs::remove_file(&target).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("mine.txt"), "USER_CONTENT").unwrap();
+
+        let removed = run_skill_deployment(
+            &store,
+            &["demo".to_string()],
+            &["hermes-profile".to_string()],
+            false,
+            false,
+        )
+        .unwrap();
+
+        // The undeploy kept the user's content and names it in `preserved`.
+        assert_eq!(
+            fs::read_to_string(target.join("mine.txt")).unwrap(),
+            "USER_CONTENT"
+        );
+        assert_eq!(removed.preserved, vec![target.to_string_lossy().to_string()]);
+        assert!(store.get_all_targets().unwrap().is_empty());
+
+        // …and the reconciliation leaves the entry — and the report — alone:
+        // the path is no longer Manager content, so its entry is not ours to
+        // take.
+        let config = fs::read_to_string(&config_path).unwrap();
+        assert!(
+            config.contains("    - skills/demo\n"),
+            "a preserved path's entry must survive; got:\n{config}"
+        );
+        assert!(
+            removed.hermes_reconciliation.is_empty(),
+            "nothing was withdrawn, so there is no reconciliation to report: {:?}",
+            removed.hermes_reconciliation
         );
 
         std::env::remove_var("HERMES_HOME");
