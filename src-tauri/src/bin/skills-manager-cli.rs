@@ -6,7 +6,7 @@ use anyhow::{Context, anyhow, bail};
 use app_lib::commands::{presets as preset_cmd, skills as cmd, tools as tool_cmd};
 use app_lib::core::{
     app_state, audit_log::AuditDraft, central_repo, error::AppError, git_backup, git_fetcher,
-    installer, merge, repo_lock::RepoLock, scenario_service, skill_metadata,
+    hermes_reconcile, installer, merge, repo_lock::RepoLock, scenario_service, skill_metadata,
     skill_store::SkillStore, skillssh_api, sync_engine, sync_metadata, tool_adapters, tool_service,
     well_known,
 };
@@ -460,6 +460,11 @@ struct SkillDeploymentReport {
     /// recorded — someone else's content now lives there (#363).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     preserved: Vec<String>,
+    /// Consumer-side reconciliation of hermes-class agents' native
+    /// `skills.external_dirs` (#535). Empty when no hermes-class agent took
+    /// part, so existing consumers see no change.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    hermes_reconciliation: Vec<hermes_reconcile::Reconciliation>,
 }
 
 struct DeploymentVerification {
@@ -517,6 +522,9 @@ struct PresetDeploymentReport {
     /// See [`SkillDeploymentReport::preserved`].
     #[serde(skip_serializing_if = "Vec::is_empty")]
     preserved: Vec<String>,
+    /// See [`SkillDeploymentReport::hermes_reconciliation`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    hermes_reconciliation: Vec<hermes_reconcile::Reconciliation>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1204,6 +1212,90 @@ fn resolve_skill_references(
     Ok(skills)
 }
 
+/// Reconcile hermes-class agents' native `skills.external_dirs` with a
+/// deploy/undeploy batch (#535). A running Hermes reader discovers managed
+/// deployments through its native config and caches resolutions per process,
+/// so removing only the managed link leaves it able to resolve the skill.
+/// Only entries naming paths this batch deployed or withdrew are touched;
+/// the editor preserves native extras, comments and unrelated settings, and
+/// holds (writes nothing) on structure it cannot rewrite — a held result is
+/// an explicit partial outcome, reported as such. A warm reader also needs
+/// the native reload step; the Manager has no channel into it, so every
+/// touched outcome carries `native_reload_required`.
+fn reconcile_hermes_consumers(
+    store: &SkillStore,
+    per_agent: Vec<(String, Vec<PathBuf>)>,
+    deploy: bool,
+    dry_run: bool,
+) -> Vec<hermes_reconcile::Reconciliation> {
+    let mut batches: Vec<(String, hermes_reconcile::HermesProfile, Vec<PathBuf>)> = Vec::new();
+    for (agent_key, paths) in per_agent {
+        if paths.is_empty() {
+            continue;
+        }
+        let Some(adapter) = tool_adapters::find_adapter_with_store(store, &agent_key) else {
+            continue;
+        };
+        let Some(profile) = hermes_reconcile::HermesProfile::from_skills_dir(&adapter.skills_dir())
+        else {
+            continue;
+        };
+        match batches.iter_mut().find(|(key, _, _)| *key == agent_key) {
+            Some((_, _, grouped)) => grouped.extend(paths),
+            None => batches.push((agent_key, profile, paths)),
+        }
+    }
+    batches
+        .into_iter()
+        .map(|(agent_key, profile, mut paths)| {
+            paths.sort();
+            paths.dedup();
+            let batch = if deploy {
+                hermes_reconcile::AgentReconcile {
+                    agent_key: agent_key.clone(),
+                    profile,
+                    add: paths,
+                    remove: Vec::new(),
+                }
+            } else {
+                hermes_reconcile::AgentReconcile {
+                    agent_key: agent_key.clone(),
+                    profile,
+                    add: Vec::new(),
+                    remove: paths,
+                }
+            };
+            let outcome = hermes_reconcile::reconcile_agent(&batch, dry_run);
+            if outcome.status == "held" {
+                log::warn!(
+                    "hermes reconciliation held for {}: {}",
+                    outcome.agent,
+                    outcome.detail.clone().unwrap_or_default()
+                );
+            }
+            outcome
+        })
+        .collect()
+}
+
+/// Group `(skill_id, agent_key)` pairs of one batch onto their target paths,
+/// using the given (skill, tool) → path table.
+fn paths_for_succeeded_pairs(
+    pairs: &std::collections::HashSet<(String, String)>,
+    rows: &[app_lib::core::skill_store::SkillTargetRecord],
+) -> Vec<(String, Vec<PathBuf>)> {
+    let mut per_agent: Vec<(String, Vec<PathBuf>)> = Vec::new();
+    for row in rows {
+        if pairs.contains(&(row.skill_id.clone(), row.tool.clone())) {
+            match per_agent.iter_mut().find(|(key, _)| *key == row.tool) {
+                Some((_, paths)) => paths.push(PathBuf::from(&row.target_path)),
+                None => per_agent.push((row.tool.clone(), vec![PathBuf::from(&row.target_path)])),
+            }
+        }
+    }
+    per_agent
+}
+
 fn run_skill_deployment(
     store: &SkillStore,
     references: &[String],
@@ -1250,9 +1342,22 @@ fn run_skill_deployment(
     let changed_pairs = changed.len();
 
     let mut preserved: Vec<String> = Vec::new();
+    let mut hermes_reconciliation: Vec<hermes_reconcile::Reconciliation> = Vec::new();
     if dry_run && deploy {
         scenario_service::preflight_add_skills_to_tools(store, &skill_ids, &agent_keys)
             .map_err(map_app_err)?;
+        // Preview the consumer-side scope: the entries a real deploy would
+        // write into hermes-class profiles' native configs (#535).
+        let planned: Vec<(String, Vec<PathBuf>)> =
+            scenario_service::planned_deployment_targets(store, &skill_ids, &agent_keys)
+                .into_iter()
+                .map(|(_, agent, path)| (agent, vec![path]))
+                .collect();
+        hermes_reconciliation = reconcile_hermes_consumers(store, planned, true, true);
+    } else if dry_run {
+        // Undeploy preview: the entries this batch would withdraw.
+        let planned = paths_for_succeeded_pairs(&changed, &existing_targets);
+        hermes_reconciliation = reconcile_hermes_consumers(store, planned, false, true);
     } else if !dry_run {
         scenario_service::apply_skills_to_tools(
             store,
@@ -1292,6 +1397,18 @@ fn run_skill_deployment(
                 verification.failures.join("; ")
             );
         }
+        // Only fully verified pairs reconcile: the rows on hand name the paths
+        // this batch actually wrote (deploy) or actually removed (undeploy).
+        // A batch with verification issues bailed above, so the native config
+        // is never reconciled against a half-removed deployment.
+        let fresh_rows = store.get_all_targets()?;
+        let rows: &Vec<app_lib::core::skill_store::SkillTargetRecord> = if deploy {
+            &fresh_rows
+        } else {
+            &existing_targets
+        };
+        let per_agent = paths_for_succeeded_pairs(&verification.succeeded, rows);
+        hermes_reconciliation = reconcile_hermes_consumers(store, per_agent, deploy, false);
     }
 
     Ok(SkillDeploymentReport {
@@ -1304,6 +1421,7 @@ fn run_skill_deployment(
         changed_pairs,
         skills: skills.into_iter().map(|skill| skill.name).collect(),
         preserved,
+        hermes_reconciliation,
     })
 }
 
@@ -2894,9 +3012,19 @@ fn run_preset_deployment(
     let changed_pairs = changed.len();
 
     let mut preserved: Vec<String> = Vec::new();
+    let mut hermes_reconciliation: Vec<hermes_reconcile::Reconciliation> = Vec::new();
     if dry_run && deploy {
         scenario_service::preflight_add_skills_to_tools(store, &skill_ids, &agent_keys)
             .map_err(map_app_err)?;
+        let planned: Vec<(String, Vec<PathBuf>)> =
+            scenario_service::planned_deployment_targets(store, &skill_ids, &agent_keys)
+                .into_iter()
+                .map(|(_, agent, path)| (agent, vec![path]))
+                .collect();
+        hermes_reconciliation = reconcile_hermes_consumers(store, planned, true, true);
+    } else if dry_run {
+        let planned = paths_for_succeeded_pairs(&changed, &existing_targets);
+        hermes_reconciliation = reconcile_hermes_consumers(store, planned, false, true);
     } else if !dry_run {
         scenario_service::apply_skills_to_tools(
             store,
@@ -2944,6 +3072,14 @@ fn run_preset_deployment(
                 verification.failures.join("; ")
             );
         }
+        let fresh_rows = store.get_all_targets()?;
+        let rows: &Vec<app_lib::core::skill_store::SkillTargetRecord> = if deploy {
+            &fresh_rows
+        } else {
+            &existing_targets
+        };
+        let per_agent = paths_for_succeeded_pairs(&verification.succeeded, rows);
+        hermes_reconciliation = reconcile_hermes_consumers(store, per_agent, deploy, false);
     }
 
     Ok(PresetDeploymentReport {
@@ -2957,6 +3093,7 @@ fn run_preset_deployment(
         pair_count,
         changed_pairs,
         preserved,
+        hermes_reconciliation,
     })
 }
 
@@ -3647,5 +3784,286 @@ mod tests {
         assert_eq!(audit.len(), audit_count + 1);
         assert_eq!(audit[0].action, "deploy");
         assert_eq!(audit[0].skill_id.as_deref(), Some("skill-demo"));
+    }
+
+    /// Serialize tests that pin Hermes's root through its own env var (the
+    /// variable is process-global, tests run in parallel threads).
+    static HERMES_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A realistic profile config: the stock template's commented-out
+    /// example, pre-existing native extras, unrelated settings, and (after a
+    /// Manager deploy) the Manager-owned profile-relative reference.
+    fn hermes_profile_config() -> String {
+        "\
+skills:
+  # Nudge the agent to create skills after complex tasks.
+  creation_nudge_interval: 15
+
+  # External skill directories — share skills across tools/agents without
+  # copying them into ~/.hermes/skills/.
+  external_dirs:
+    # Pre-existing native extras — must survive untouched.
+    - ~/.agents/skills
+    - /shared/team-skills
+  create_dir: \"\"
+
+agent:
+  max_iterations: 500
+"
+        .to_string()
+    }
+
+    fn hermes_profile_store(tmp: &tempfile::TempDir, skills_root: &Path) -> SkillStore {
+        let store = SkillStore::new(&tmp.path().join("skills.db")).unwrap();
+        let source = tmp.path().join("central/demo");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join("SKILL.md"),
+            "---\nname: demo\ndescription: test skill\n---\n",
+        )
+        .unwrap();
+        fs::write(source.join("payload.txt"), "managed").unwrap();
+        store.set_setting("sync_mode", "copy").unwrap();
+        tool_service::set_custom_tools(
+            &store,
+            &[CustomToolDef {
+                key: "hermes-profile".to_string(),
+                display_name: "Hermes Profile".to_string(),
+                skills_dir: skills_root.to_string_lossy().to_string(),
+                project_relative_skills_dir: None,
+                category: ToolCategory::Lobster,
+            }],
+        )
+        .unwrap();
+        store
+            .insert_skill(&SkillRecord {
+                id: "skill-demo".to_string(),
+                name: "demo".to_string(),
+                description: Some("test skill".to_string()),
+                source_type: "local".to_string(),
+                source_ref: Some(source.to_string_lossy().to_string()),
+                source_ref_resolved: None,
+                source_subpath: None,
+                source_branch: None,
+                source_revision: None,
+                remote_revision: None,
+                central_path: source.to_string_lossy().to_string(),
+                content_hash: None,
+                enabled: true,
+                created_at: 1,
+                updated_at: 1,
+                status: "ok".to_string(),
+                update_status: "local_only".to_string(),
+                last_checked_at: None,
+                last_check_error: None,
+            })
+            .unwrap();
+        store
+    }
+
+    /// #535: a Hermes reader discovers Manager deployments through its native
+    /// `skills.external_dirs`, so deploy must write the Manager-owned
+    /// profile-relative reference and undeploy must withdraw exactly it —
+    /// leaving native extras, comments and unrelated settings untouched.
+    /// Manager link removal alone (the pre-fix behavior) never touches the
+    /// config, which is the reported withdrawal gap.
+    #[test]
+    fn hermes_deploy_and_undeploy_reconcile_the_native_config() {
+        let _env_guard = HERMES_HOME_LOCK.lock().unwrap();
+        let tmp = tempdir().unwrap();
+        let hermes_home = tmp.path().join(".hermes");
+        let skills_root = hermes_home.join("skills");
+        fs::create_dir_all(&skills_root).unwrap();
+        let config_path = hermes_home.join("config.yaml");
+        let original = hermes_profile_config();
+        fs::write(&config_path, &original).unwrap();
+        std::env::set_var("HERMES_HOME", &hermes_home);
+
+        let store = hermes_profile_store(&tmp, &skills_root);
+
+        run_skill_deployment(
+            &store,
+            &["demo".to_string()],
+            &["hermes-profile".to_string()],
+            true,
+            false,
+        )
+        .unwrap();
+        let deployed = fs::read_to_string(&config_path).unwrap();
+        assert!(
+            deployed.contains("    - skills/demo\n"),
+            "deploy must write the profile-relative reference; got:\n{deployed}"
+        );
+        assert!(skills_root.join("demo/payload.txt").exists());
+
+        run_skill_deployment(
+            &store,
+            &["demo".to_string()],
+            &["hermes-profile".to_string()],
+            false,
+            false,
+        )
+        .unwrap();
+        let after = fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !after.contains("skills/demo"),
+            "undeploy must withdraw the reference; got:\n{after}"
+        );
+        assert!(!skills_root.join("demo").exists());
+        // Everything the Manager does not own survives verbatim.
+        for kept in [
+            "# Pre-existing native extras — must survive untouched.",
+            "    - ~/.agents/skills\n    - /shared/team-skills",
+            "creation_nudge_interval: 15",
+            "max_iterations: 500",
+        ] {
+            assert!(after.contains(kept), "lost: {kept}");
+        }
+        // The only lines ever touched are Manager-owned entries: the two
+        // configs differ from the original only by that one line.
+        let without_entry = |text: &str| -> String {
+            text.lines()
+                .filter(|line| *line != "    - skills/demo")
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(without_entry(&deployed), original.trim_end_matches('\n'));
+        assert_eq!(without_entry(&after), original.trim_end_matches('\n'));
+
+        std::env::remove_var("HERMES_HOME");
+    }
+
+    /// The reconciliation contract in the reports: planned previews for
+    /// dry-runs (config untouched), reconciled outcomes for real runs, held
+    /// (with the config untouched) when the native file cannot be rewritten,
+    /// and no-op reconciliation when the config already matches.
+    #[test]
+    fn hermes_reconciliation_reports_planned_reconciled_and_held() {
+        let _env_guard = HERMES_HOME_LOCK.lock().unwrap();
+        let tmp = tempdir().unwrap();
+        let hermes_home = tmp.path().join(".hermes");
+        let skills_root = hermes_home.join("skills");
+        fs::create_dir_all(&skills_root).unwrap();
+        let config_path = hermes_home.join("config.yaml");
+        let original = hermes_profile_config();
+        fs::write(&config_path, &original).unwrap();
+        std::env::set_var("HERMES_HOME", &hermes_home);
+        let store = hermes_profile_store(&tmp, &skills_root);
+
+        // Dry-run deploy plans the reference and writes nothing.
+        let planned = run_skill_deployment(
+            &store,
+            &["demo".to_string()],
+            &["hermes-profile".to_string()],
+            true,
+            true,
+        )
+        .unwrap();
+        let plan = &planned.hermes_reconciliation;
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].status, "planned");
+        assert_eq!(plan[0].added, vec!["skills/demo".to_string()]);
+        assert!(plan[0].native_reload_required);
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+
+        // Real deploy reconciles.
+        let deployed = run_skill_deployment(
+            &store,
+            &["demo".to_string()],
+            &["hermes-profile".to_string()],
+            true,
+            false,
+        )
+        .unwrap();
+        let report = &deployed.hermes_reconciliation;
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].agent, "hermes-profile");
+        assert_eq!(report[0].status, "reconciled");
+        assert_eq!(report[0].added, vec!["skills/demo".to_string()]);
+        assert!(report[0].removed.is_empty());
+
+        // Redeploying is a no-op reconciliation (entry already present).
+        let again = run_skill_deployment(
+            &store,
+            &["demo".to_string()],
+            &["hermes-profile".to_string()],
+            true,
+            false,
+        )
+        .unwrap();
+        let noop = &again.hermes_reconciliation;
+        assert_eq!(noop[0].status, "reconciled");
+        assert!(noop[0].added.is_empty() && noop[0].removed.is_empty());
+
+        // Dry-run undeploy plans the withdrawal and writes nothing.
+        let planned_remove = run_skill_deployment(
+            &store,
+            &["demo".to_string()],
+            &["hermes-profile".to_string()],
+            false,
+            true,
+        )
+        .unwrap();
+        let plan = &planned_remove.hermes_reconciliation;
+        assert_eq!(plan[0].status, "planned");
+        assert_eq!(plan[0].removed, vec!["skills/demo".to_string()]);
+        assert!(fs::read_to_string(&config_path)
+            .unwrap()
+            .contains("skills/demo"));
+
+        // Real undeploy withdraws exactly the Manager-owned entry.
+        let removed = run_skill_deployment(
+            &store,
+            &["demo".to_string()],
+            &["hermes-profile".to_string()],
+            false,
+            false,
+        )
+        .unwrap();
+        let report = &removed.hermes_reconciliation;
+        assert_eq!(report[0].status, "reconciled");
+        assert_eq!(report[0].removed, vec!["skills/demo".to_string()]);
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+
+        // A config this editor cannot rewrite is held, untouched, while the
+        // deployment itself still succeeds — an explicit partial result.
+        fs::write(
+            &config_path,
+            "skills:\n  external_dirs: [~/.agents/skills]\n",
+        )
+        .unwrap();
+        run_skill_deployment(
+            &store,
+            &["demo".to_string()],
+            &["hermes-profile".to_string()],
+            true,
+            false,
+        )
+        .unwrap();
+        let held = run_skill_deployment(
+            &store,
+            &["demo".to_string()],
+            &["hermes-profile".to_string()],
+            false,
+            false,
+        )
+        .unwrap();
+        let report = &held.hermes_reconciliation;
+        assert_eq!(report[0].status, "held");
+        assert!(report[0]
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("flow-style"));
+        assert_eq!(
+            fs::read_to_string(&config_path).unwrap(),
+            "skills:\n  external_dirs: [~/.agents/skills]\n"
+        );
+        assert!(
+            !skills_root.join("demo").exists(),
+            "the undeploy itself still ran"
+        );
+
+        std::env::remove_var("HERMES_HOME");
     }
 }

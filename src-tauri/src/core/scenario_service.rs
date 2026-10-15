@@ -127,6 +127,44 @@ fn is_skill_path_within_root(path: &Path, root: &Path) -> bool {
     })
 }
 
+/// The target path every (skill, agent) pair of a would-be deploy lands on,
+/// computed exactly as `apply_add` plans it but without writing — the dry-run
+/// preview and the Hermes consumer-side reconciliation (#535) must name the
+/// same paths the real deployment will.
+pub fn planned_deployment_targets(
+    store: &SkillStore,
+    skill_ids: &[String],
+    agent_keys: &[String],
+) -> Vec<(String, String, PathBuf)> {
+    let disabled = tool_service::get_disabled_tools(store);
+    let existing_targets = store.get_all_targets().unwrap_or_default();
+    let mut out = Vec::new();
+    for key in agent_keys {
+        if disabled.contains(key) {
+            continue;
+        }
+        let Some(adapter) = tool_adapters::find_adapter_with_store(store, key) else {
+            continue;
+        };
+        if !adapter.is_installed() {
+            continue;
+        }
+        for skill_id in skill_ids {
+            let Ok(Some(skill)) = store.get_skill_by_id(skill_id) else {
+                continue;
+            };
+            let source = PathBuf::from(&skill.central_path);
+            let target_name = sync_engine::target_dir_name(&source, &skill.name);
+            out.push((
+                skill_id.clone(),
+                key.clone(),
+                deployment_target(&adapter, &target_name, skill_id, &existing_targets),
+            ));
+        }
+    }
+    out
+}
+
 pub fn preview_scenario_sync(
     store: &SkillStore,
     scenario_id: &str,
